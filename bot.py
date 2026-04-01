@@ -1,40 +1,65 @@
-import requests
 import os
-from telegram.ext import Updater, CommandHandler
+import requests
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 TOKEN = os.getenv("BOT_TOKEN")
 
-def start(update, context):
-    update.message.reply_text("🚀 Momentum Sniper is LIVE\nUse /hot")
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🚀 Momentum Sniper is LIVE\nUse /hot")
+
 
 def get_trending():
     url = "https://api.dexscreener.com/latest/dex/search?q=sol"
-    res = requests.get(url).json()
+    res = requests.get(url, timeout=15)
+    res.raise_for_status()
+    data = res.json()
+
+    pairs = data.get("pairs", [])
+    if not pairs:
+        return "No tokens found right now."
 
     tokens = []
 
-    for pair in res["pairs"][:5]:
-        name = pair["baseToken"]["name"]
-        price = pair["priceUsd"]
-        volume = pair["volume"]["h24"]
-        liquidity = pair["liquidity"]["usd"]
+    for pair in pairs[:5]:
+        base = pair.get("baseToken", {})
+        volume = pair.get("volume", {})
+        liquidity = pair.get("liquidity", {})
+
+        name = base.get("name", "Unknown")
+        price = pair.get("priceUsd", "N/A")
+        vol24 = volume.get("h24", "N/A")
+        liq_usd = liquidity.get("usd", "N/A")
 
         tokens.append(
-            f"{name}\n💰 ${price}\n📊 Vol: {volume}\n💧 Liq: {liquidity}\n"
+            f"{name}\n💰 ${price}\n📊 Vol: {vol24}\n💧 Liq: {liq_usd}"
         )
 
     return "\n---\n".join(tokens)
 
-def hot(update, context):
-    update.message.reply_text("🔥 Scanning...")
-    data = get_trending()
-    update.message.reply_text(data)
 
-updater = Updater(TOKEN, use_context=True)
+async def hot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔥 Scanning...")
 
-dp = updater.dispatcher
-dp.add_handler(CommandHandler("start", start))
-dp.add_handler(CommandHandler("hot", hot))
+    try:
+        data = get_trending()
+        await update.message.reply_text(data)
+    except Exception as e:
+        await update.message.reply_text(f"Error scanning market: {e}")
 
-updater.start_polling()
-updater.idle()
+
+def main():
+    if not TOKEN:
+        raise ValueError("BOT_TOKEN is missing from Railway variables")
+
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("hot", hot))
+
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
