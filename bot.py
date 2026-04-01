@@ -6,15 +6,13 @@ import requests
 from pathlib import Path
 from urllib.parse import quote
 
-# =========================
-# CONFIG
-# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 SOLANATRACKER_API_KEY = os.getenv("SOLANATRACKER_API_KEY", "").strip()
-ALERT_MIN_SCORE = float(os.getenv("ALERT_MIN_SCORE", "72"))
-ALERT_INTERVAL_SECONDS = int(os.getenv("ALERT_INTERVAL_SECONDS", "90"))
+ALERT_MIN_SCORE = float(os.getenv("ALERT_MIN_SCORE", "60"))
+ALERT_MIN_EARLY_SCORE = float(os.getenv("ALERT_MIN_EARLY_SCORE", "58"))
+ALERT_INTERVAL_SECONDS = int(os.getenv("ALERT_INTERVAL_SECONDS", "30"))
 REQUEST_TIMEOUT = 20
 
 DATA_DIR = Path(".")
@@ -22,14 +20,11 @@ WALLETS_FILE = DATA_DIR / "watched_wallets.json"
 CHAT_SETTINGS_FILE = DATA_DIR / "chat_settings.json"
 ALERT_STATE_FILE = DATA_DIR / "alert_state.json"
 
-MIN_SEND_LIQ = 12000
-MIN_SEND_VOL = 25000
-MIN_EARLY_LIQ = 4000
+MIN_SEND_LIQ = 8000
+MIN_SEND_VOL = 15000
+MIN_EARLY_LIQ = 3000
 RESULT_LIMIT = 5
 
-# =========================
-# FILE HELPERS
-# =========================
 def load_json(path: Path, default):
     try:
         if path.exists():
@@ -38,18 +33,13 @@ def load_json(path: Path, default):
         pass
     return default
 
-
 def save_json(path: Path, data):
     path.write_text(json.dumps(data, indent=2))
-
 
 WATCHED_WALLETS = load_json(WALLETS_FILE, [])
 CHAT_SETTINGS = load_json(CHAT_SETTINGS_FILE, {})
 ALERT_STATE = load_json(ALERT_STATE_FILE, {"seen_tokens": {}})
 
-# =========================
-# UTILS
-# =========================
 def safe_float(value, default=0.0):
     try:
         if value is None or value == "":
@@ -58,10 +48,8 @@ def safe_float(value, default=0.0):
     except (ValueError, TypeError):
         return default
 
-
 def now_ts():
     return int(time.time())
-
 
 def format_price(value):
     num = safe_float(value, 0.0)
@@ -71,7 +59,6 @@ def format_price(value):
         return f"{num:.8f}".rstrip("0").rstrip(".")
     return f"{num:.12f}".rstrip("0").rstrip(".")
 
-
 def format_num(value):
     num = safe_float(value, 0.0)
     if num >= 1_000_000:
@@ -80,19 +67,14 @@ def format_num(value):
         return f"{num/1_000:.2f}K"
     return f"{num:.2f}"
 
-
 def clamp(value, low, high):
     return max(low, min(high, value))
-
 
 def escape(text):
     return html.escape(str(text))
 
-
 def make_buy_link(token_address):
-    # Generic Jupiter swap page link for quick manual action
     return f"https://jup.ag/swap/SOL-{quote(token_address)}"
-
 
 def send_message(chat_id, text):
     requests.post(
@@ -106,23 +88,14 @@ def send_message(chat_id, text):
         timeout=REQUEST_TIMEOUT,
     )
 
-
-# =========================
-# TELEGRAM HELPERS
-# =========================
 def get_updates(offset=None):
-    params = {"timeout": 30}
+    params = {"timeout": 25}
     if offset is not None:
         params["offset"] = offset
-
-    r = requests.get(f"{BASE_URL}/getUpdates", params=params, timeout=35)
+    r = requests.get(f"{BASE_URL}/getUpdates", params=params, timeout=30)
     r.raise_for_status()
     return r.json()
 
-
-# =========================
-# DEXSCREENER HELPERS
-# =========================
 def dex_latest_profiles():
     r = requests.get(
         "https://api.dexscreener.com/token-profiles/latest/v1",
@@ -131,7 +104,6 @@ def dex_latest_profiles():
     r.raise_for_status()
     return r.json()
 
-
 def dex_boosts_latest():
     r = requests.get(
         "https://api.dexscreener.com/token-boosts/latest/v1",
@@ -139,7 +111,6 @@ def dex_boosts_latest():
     )
     r.raise_for_status()
     return r.json()
-
 
 def dex_search(query):
     r = requests.get(
@@ -150,7 +121,6 @@ def dex_search(query):
     r.raise_for_status()
     return r.json().get("pairs", [])
 
-
 def dex_tokens(chain_id, token_addresses):
     if not token_addresses:
         return []
@@ -160,7 +130,6 @@ def dex_tokens(chain_id, token_addresses):
     r.raise_for_status()
     return r.json()
 
-
 def dex_paid_orders(chain_id, token_address):
     url = f"https://api.dexscreener.com/orders/v1/{chain_id}/{token_address}"
     r = requests.get(url, timeout=REQUEST_TIMEOUT)
@@ -168,10 +137,6 @@ def dex_paid_orders(chain_id, token_address):
     data = r.json()
     return data if isinstance(data, list) else []
 
-
-# =========================
-# SOLANATRACKER HELPERS (OPTIONAL)
-# =========================
 def st_wallet_trades(wallet):
     if not SOLANATRACKER_API_KEY:
         return []
@@ -185,10 +150,6 @@ def st_wallet_trades(wallet):
     data = r.json()
     return data.get("trades", [])
 
-
-# =========================
-# SCORING
-# =========================
 def build_boost_lookup():
     lookup = {}
     try:
@@ -200,7 +161,6 @@ def build_boost_lookup():
         pass
     return lookup
 
-
 def pick_best_pairs(pairs):
     best = {}
     for pair in pairs:
@@ -209,20 +169,17 @@ def pick_best_pairs(pairs):
         addr = pair.get("baseToken", {}).get("address")
         if not addr:
             continue
-
         liquidity = safe_float(pair.get("liquidity", {}).get("usd"))
         current = best.get(addr)
         if current is None or liquidity > safe_float(current.get("liquidity", {}).get("usd")):
             best[addr] = pair
     return list(best.values())
 
-
 def token_age_minutes(pair):
     created_ms = pair.get("pairCreatedAt")
     if not created_ms:
         return 999999
     return max(0, int((now_ts() * 1000 - created_ms) / 60000))
-
 
 def wallet_cluster_for_token(token_address, minutes=20):
     if not SOLANATRACKER_API_KEY or not WATCHED_WALLETS:
@@ -246,7 +203,6 @@ def wallet_cluster_for_token(token_address, minutes=20):
     unique = sorted(set(matched))
     return {"count": len(unique), "wallets": unique}
 
-
 def paid_order_penalty(token_address):
     try:
         orders = dex_paid_orders("solana", token_address)
@@ -254,7 +210,6 @@ def paid_order_penalty(token_address):
         return 8 if approved else 0
     except Exception:
         return 0
-
 
 def score_send(pair, boost_lookup):
     token = pair.get("baseToken", {})
@@ -265,30 +220,29 @@ def score_send(pair, boost_lookup):
     pc6 = safe_float(pair.get("priceChange", {}).get("h6"))
     pc1 = safe_float(pair.get("priceChange", {}).get("h1"))
     fdv = safe_float(pair.get("fdv"))
-    mcap = safe_float(pair.get("marketCap"))
     age_mins = token_age_minutes(pair)
 
     momentum = 0
-    momentum += clamp(volume / 60000, 0, 22)
-    momentum += clamp(max(pc1, 0) / 2, 0, 10)
-    momentum += clamp(max(pc6, 0) / 3, 0, 8)
-    momentum += clamp(max(pc24, 0) / 6, 0, 10)
+    momentum += clamp(volume / 45000, 0, 25)
+    momentum += clamp(max(pc1, 0) / 1.5, 0, 12)
+    momentum += clamp(max(pc6, 0) / 2.5, 0, 10)
+    momentum += clamp(max(pc24, 0) / 5, 0, 10)
 
     quality = 0
-    quality += clamp(liquidity / 10000, 0, 18)
+    quality += clamp(liquidity / 8000, 0, 20)
     liq_to_fdv = liquidity / fdv if fdv > 0 else 0
     if 0.01 <= liq_to_fdv <= 0.35:
-        quality += 7
+        quality += 8
     elif liq_to_fdv > 0:
         quality += 3
 
     freshness = 0
     if age_mins <= 60:
-        freshness = 10
+        freshness = 12
     elif age_mins <= 240:
-        freshness = 7
+        freshness = 8
     elif age_mins <= 1440:
-        freshness = 3
+        freshness = 4
 
     wallet_cluster = wallet_cluster_for_token(addr, minutes=20)
     wallet_score = 0
@@ -301,13 +255,13 @@ def score_send(pair, boost_lookup):
 
     risk_penalty = 0
     if liquidity < MIN_SEND_LIQ:
-        risk_penalty += 10
-    if pc24 > 120:
         risk_penalty += 8
-    if fdv > 0 and liquidity > 0 and fdv / liquidity > 80:
+    if pc24 > 150:
+        risk_penalty += 8
+    if fdv > 0 and liquidity > 0 and fdv / liquidity > 100:
         risk_penalty += 6
     if addr in boost_lookup:
-        risk_penalty += 6
+        risk_penalty += 4
     risk_penalty += paid_order_penalty(addr)
 
     score = momentum + quality + freshness + wallet_score - risk_penalty
@@ -331,13 +285,10 @@ def score_send(pair, boost_lookup):
             "pc24": pc24,
             "pc6": pc6,
             "pc1": pc1,
-            "fdv": fdv,
-            "mcap": mcap,
             "age_mins": age_mins,
             "boosted": addr in boost_lookup,
         },
     }
-
 
 def score_early(pair, boost_lookup):
     token = pair.get("baseToken", {})
@@ -349,11 +300,11 @@ def score_early(pair, boost_lookup):
     age_mins = token_age_minutes(pair)
 
     score = 0
-    score += clamp((60 - min(age_mins, 60)) / 2, 0, 30)  # newest gets more
-    score += clamp(liquidity / 3000, 0, 20)
-    score += clamp(volume / 12000, 0, 20)
-    score += clamp(max(pc1, 0) / 2, 0, 12)
-    score += clamp(max(pc24, 0) / 5, 0, 10)
+    score += clamp((90 - min(age_mins, 90)) / 2.2, 0, 35)
+    score += clamp(liquidity / 2500, 0, 20)
+    score += clamp(volume / 9000, 0, 20)
+    score += clamp(max(pc1, 0) / 1.5, 0, 12)
+    score += clamp(max(pc24, 0) / 4, 0, 10)
 
     wallet_cluster = wallet_cluster_for_token(addr, minutes=15)
     if wallet_cluster["count"] >= 2:
@@ -362,11 +313,11 @@ def score_early(pair, boost_lookup):
         score += 6
 
     if liquidity < MIN_EARLY_LIQ:
-        score -= 12
-    if pc24 > 150:
+        score -= 10
+    if pc24 > 180:
         score -= 8
     if addr in boost_lookup:
-        score -= 4
+        score -= 3
     score -= paid_order_penalty(addr)
 
     score = round(clamp(score, 0, 100), 1)
@@ -391,10 +342,6 @@ def score_early(pair, boost_lookup):
         },
     }
 
-
-# =========================
-# FORMATTERS
-# =========================
 def format_pair_message(pair, scored, mode="send"):
     token = pair.get("baseToken", {})
     addr = token.get("address", "N/A")
@@ -450,14 +397,9 @@ def format_pair_message(pair, scored, mode="send"):
 
     return "\n".join(parts)
 
-
-# =========================
-# SCANNERS
-# =========================
 def get_send_candidates():
     boost_lookup = build_boost_lookup()
-
-    queries = ["solana", "raydium solana", "pump solana", "bonk solana"]
+    queries = ["solana", "pump solana", "bonk solana", "raydium solana", "new solana"]
     raw_pairs = []
     for q in queries:
         try:
@@ -475,12 +417,11 @@ def get_send_candidates():
             continue
 
         result = score_send(pair, boost_lookup)
-        if result["score"] >= 55:
+        if result["score"] >= 50:
             scored.append((pair, result))
 
     scored.sort(key=lambda x: x[1]["score"], reverse=True)
     return scored[:RESULT_LIMIT]
-
 
 def get_early_candidates():
     boost_lookup = build_boost_lookup()
@@ -491,7 +432,6 @@ def get_early_candidates():
         if item.get("chainId") == "solana" and item.get("tokenAddress"):
             sol_addrs.append(item["tokenAddress"])
 
-    # newest first, take a chunk, hydrate pairs
     sol_addrs = sol_addrs[:30]
     raw_pairs = dex_tokens("solana", sol_addrs)
     pairs = pick_best_pairs(raw_pairs)
@@ -506,19 +446,18 @@ def get_early_candidates():
             continue
 
         result = score_early(pair, boost_lookup)
-        if result["score"] >= 50:
+        if result["score"] >= 45:
             scored.append((pair, result))
 
     scored.sort(key=lambda x: x[1]["score"], reverse=True)
     return scored[:RESULT_LIMIT]
-
 
 def get_wallet_cluster_summary():
     if not SOLANATRACKER_API_KEY:
         return "Set SOLANATRACKER_API_KEY first to use wallet clustering."
 
     if not WATCHED_WALLETS:
-        return "No watched wallets yet. Use /watchwallet <address>"
+        return "No watched wallets yet. Use /watchwallet &lt;address&gt;"
 
     counts = {}
     cutoff_ms = (now_ts() - 20 * 60) * 1000
@@ -563,10 +502,6 @@ def get_wallet_cluster_summary():
 
     return "\n".join(lines).strip()
 
-
-# =========================
-# COMMAND HANDLERS
-# =========================
 def ensure_chat(chat_id):
     key = str(chat_id)
     if key not in CHAT_SETTINGS:
@@ -574,13 +509,13 @@ def ensure_chat(chat_id):
         save_json(CHAT_SETTINGS_FILE, CHAT_SETTINGS)
     return CHAT_SETTINGS[key]
 
-
 def handle_command(chat_id, text):
     ensure_chat(chat_id)
-    parts = text.strip().split()
+    raw = text.strip()
+    parts = raw.split()
     cmd = parts[0].lower()
 
-    if cmd == "/start" or cmd == "/help":
+    if cmd in ("/start", "/help"):
         send_message(
             chat_id,
             "🚀 <b>Sniper Bot is LIVE</b>\n\n"
@@ -592,7 +527,23 @@ def handle_command(chat_id, text):
             "/unwatchwallet &lt;address&gt; - remove wallet\n"
             "/wallets - list watched wallets\n"
             "/alerts on - enable push alerts\n"
-            "/alerts off - disable push alerts",
+            "/alerts off - disable push alerts\n"
+            "/alertson - enable push alerts\n"
+            "/alertsoff - disable push alerts\n"
+            "/status - bot status",
+        )
+        return
+
+    if cmd == "/status":
+        state = "ON" if CHAT_SETTINGS[str(chat_id)].get("alerts") else "OFF"
+        send_message(
+            chat_id,
+            "📡 <b>Status</b>\n\n"
+            f"Alerts: <b>{state}</b>\n"
+            f"Alert interval: <b>{ALERT_INTERVAL_SECONDS}s</b>\n"
+            f"Send threshold: <b>{ALERT_MIN_SCORE}</b>\n"
+            f"Early threshold: <b>{ALERT_MIN_EARLY_SCORE}</b>\n"
+            f"Watched wallets: <b>{len(WATCHED_WALLETS)}</b>"
         )
         return
 
@@ -628,7 +579,7 @@ def handle_command(chat_id, text):
 
     if cmd == "/watchwallet":
         if len(parts) < 2:
-            send_message(chat_id, "Use: /watchwallet <wallet_address>")
+            send_message(chat_id, "Use: /watchwallet &lt;wallet_address&gt;")
             return
         wallet = parts[1].strip()
         if wallet not in WATCHED_WALLETS:
@@ -639,7 +590,7 @@ def handle_command(chat_id, text):
 
     if cmd == "/unwatchwallet":
         if len(parts) < 2:
-            send_message(chat_id, "Use: /unwatchwallet <wallet_address>")
+            send_message(chat_id, "Use: /unwatchwallet &lt;wallet_address&gt;")
             return
         wallet = parts[1].strip()
         if wallet in WATCHED_WALLETS:
@@ -667,6 +618,18 @@ def handle_command(chat_id, text):
             send_message(chat_id, f"Wallet cluster error: {escape(e)}")
         return
 
+    if cmd in ("/alertson",):
+        CHAT_SETTINGS[str(chat_id)]["alerts"] = True
+        save_json(CHAT_SETTINGS_FILE, CHAT_SETTINGS)
+        send_message(chat_id, "Alerts turned on.")
+        return
+
+    if cmd in ("/alertsoff",):
+        CHAT_SETTINGS[str(chat_id)]["alerts"] = False
+        save_json(CHAT_SETTINGS_FILE, CHAT_SETTINGS)
+        send_message(chat_id, "Alerts turned off.")
+        return
+
     if cmd == "/alerts":
         if len(parts) < 2:
             state = "on" if CHAT_SETTINGS[str(chat_id)].get("alerts") else "off"
@@ -681,59 +644,64 @@ def handle_command(chat_id, text):
         send_message(chat_id, f"Alerts turned {toggle}.")
         return
 
-
-# =========================
-# AUTO ALERT LOOP
-# =========================
 def alert_loop():
     enabled_chats = [cid for cid, s in CHAT_SETTINGS.items() if s.get("alerts")]
     if not enabled_chats:
         return
 
+    candidates = []
+
     try:
-        setups = get_send_candidates()
+        for pair, result in get_send_candidates():
+            if result["score"] >= ALERT_MIN_SCORE:
+                candidates.append(("send", pair, result))
     except Exception as e:
-        print(f"alert scan error: {e}")
-        return
+        print(f"send alert scan error: {e}")
 
-    for pair, result in setups:
+    try:
+        for pair, result in get_early_candidates():
+            if result["score"] >= ALERT_MIN_EARLY_SCORE:
+                candidates.append(("early", pair, result))
+    except Exception as e:
+        print(f"early alert scan error: {e}")
+
+    for mode, pair, result in candidates:
         token_addr = pair.get("baseToken", {}).get("address")
-        if not token_addr or result["score"] < ALERT_MIN_SCORE:
+        if not token_addr:
             continue
 
-        last_sent = ALERT_STATE["seen_tokens"].get(token_addr, 0)
-        if now_ts() - last_sent < 3600:
+        key = f"{mode}:{token_addr}"
+        last_sent = ALERT_STATE["seen_tokens"].get(key, 0)
+
+        if now_ts() - last_sent < 1800:
             continue
 
-        msg = "🚨 <b>Auto alert</b>\n\n" + format_pair_message(pair, result, mode="send")
+        header = "🚨 <b>Auto send alert</b>\n\n" if mode == "send" else "🆕 <b>Auto early alert</b>\n\n"
+        msg = header + format_pair_message(pair, result, mode="send" if mode == "send" else "early")
+
         for chat_id in enabled_chats:
             try:
                 send_message(chat_id, msg)
             except Exception:
                 pass
 
-        ALERT_STATE["seen_tokens"][token_addr] = now_ts()
+        ALERT_STATE["seen_tokens"][key] = now_ts()
         save_json(ALERT_STATE_FILE, ALERT_STATE)
 
-
-# =========================
-# MAIN LOOP
-# =========================
 def main():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN is missing")
 
+    print("Sniper bot starting...")
     offset = None
     last_alert_run = 0
 
     while True:
         try:
-            # periodic alerts
             if now_ts() - last_alert_run >= ALERT_INTERVAL_SECONDS:
                 alert_loop()
                 last_alert_run = now_ts()
 
-            # telegram updates
             data = get_updates(offset)
             for update in data.get("result", []):
                 offset = update["update_id"] + 1
@@ -749,7 +717,6 @@ def main():
         except Exception as e:
             print(f"main loop error: {e}")
             time.sleep(5)
-
 
 if __name__ == "__main__":
     main()
