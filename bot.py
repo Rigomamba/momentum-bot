@@ -5,6 +5,10 @@ import requests
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+MIN_LIQUIDITY = 20000
+MIN_VOLUME_24H = 50000
+MIN_PRICE_CHANGE_24H = 5
+
 
 def send_message(chat_id, text):
     requests.post(
@@ -14,8 +18,20 @@ def send_message(chat_id, text):
     )
 
 
-def get_trending():
-    url = "https://api.dexscreener.com/latest/dex/search?q=sol"
+def score_pair(pair):
+    volume = float(pair.get("volume", {}).get("h24") or 0)
+    liquidity = float(pair.get("liquidity", {}).get("usd") or 0)
+    price_change = float(pair.get("priceChange", {}).get("h24") or 0)
+
+    score = 0
+    score += min(volume / 10000, 40)
+    score += min(liquidity / 10000, 30)
+    score += min(max(price_change, 0), 30)
+    return round(score, 1)
+
+
+def get_hot_tokens():
+    url = "https://api.dexscreener.com/latest/dex/search?q=solana"
     res = requests.get(url, timeout=20)
     res.raise_for_status()
     data = res.json()
@@ -24,18 +40,64 @@ def get_trending():
     if not pairs:
         return "No tokens found right now."
 
-    tokens = []
-    for pair in pairs[:5]:
-        name = pair.get("baseToken", {}).get("name", "Unknown")
-        price = pair.get("priceUsd", "N/A")
-        volume = pair.get("volume", {}).get("h24", "N/A")
-        liquidity = pair.get("liquidity", {}).get("usd", "N/A")
+    filtered = []
+    seen = set()
 
-        tokens.append(
-            f"{name}\n💰 ${price}\n📊 Vol: {volume}\n💧 Liq: {liquidity}"
+    for pair in pairs:
+        base = pair.get("baseToken", {})
+        name = base.get("name", "Unknown")
+        address = base.get("address", "")
+        volume = float(pair.get("volume", {}).get("h24") or 0)
+        liquidity = float(pair.get("liquidity", {}).get("usd") or 0)
+        price_change = float(pair.get("priceChange", {}).get("h24") or 0)
+        price = pair.get("priceUsd", "N/A")
+        chain_id = pair.get("chainId", "")
+
+        if chain_id != "solana":
+            continue
+
+        if not address or address in seen:
+            continue
+
+        if liquidity < MIN_LIQUIDITY:
+            continue
+
+        if volume < MIN_VOLUME_24H:
+            continue
+
+        if price_change < MIN_PRICE_CHANGE_24H:
+            continue
+
+        seen.add(address)
+
+        filtered.append(
+            {
+                "name": name,
+                "price": price,
+                "volume": volume,
+                "liquidity": liquidity,
+                "price_change": price_change,
+                "score": score_pair(pair),
+            }
         )
 
-    return "\n---\n".join(tokens)
+    if not filtered:
+        return "No strong momentum tokens found right now."
+
+    filtered.sort(key=lambda x: x["score"], reverse=True)
+
+    messages = []
+    for token in filtered[:5]:
+        messages.append(
+            f"{token['name']}\n"
+            f"🔥 Score: {token['score']}\n"
+            f"💰 Price: ${token['price']}\n"
+            f"📈 24h Change: {token['price_change']}%\n"
+            f"📊 Vol: {token['volume']:.2f}\n"
+            f"💧 Liq: {token['liquidity']:.2f}"
+        )
+
+    return "\n---\n".join(messages)
 
 
 def handle_message(message):
@@ -43,12 +105,15 @@ def handle_message(message):
     text = message.get("text", "")
 
     if text == "/start":
-        send_message(chat_id, "🚀 Momentum Sniper is LIVE\nUse /hot")
+        send_message(
+            chat_id,
+            "🚀 Momentum Sniper is LIVE\n\nCommands:\n/hot - strongest filtered tokens",
+        )
     elif text == "/hot":
-        send_message(chat_id, "🔥 Scanning...")
+        send_message(chat_id, "🔥 Scanning for strong momentum setups...")
         try:
-            trending = get_trending()
-            send_message(chat_id, trending)
+            result = get_hot_tokens()
+            send_message(chat_id, result)
         except Exception as e:
             send_message(chat_id, f"Error scanning market: {e}")
 
