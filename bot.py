@@ -12,28 +12,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def get_trending():
     url = "https://api.dexscreener.com/latest/dex/search?q=sol"
-    res = requests.get(url, timeout=15)
-    res.raise_for_status()
-    data = res.json()
-
-    pairs = data.get("pairs", [])
-    if not pairs:
-        return "No tokens found right now."
+    res = requests.get(url).json()
 
     tokens = []
 
-    for pair in pairs[:5]:
-        base = pair.get("baseToken", {})
-        volume = pair.get("volume", {})
-        liquidity = pair.get("liquidity", {})
-
-        name = base.get("name", "Unknown")
+    for pair in res.get("pairs", [])[:5]:
+        name = pair.get("baseToken", {}).get("name", "Unknown")
         price = pair.get("priceUsd", "N/A")
-        vol24 = volume.get("h24", "N/A")
-        liq_usd = liquidity.get("usd", "N/A")
+        volume = pair.get("volume", {}).get("h24", "N/A")
+        liquidity = pair.get("liquidity", {}).get("usd", "N/A")
 
         tokens.append(
-            f"{name}\n💰 ${price}\n📊 Vol: {vol24}\n💧 Liq: {liq_usd}"
+            f"{name}\n💰 ${price}\n📊 Vol: {volume}\n💧 Liq: {liquidity}"
         )
 
     return "\n---\n".join(tokens)
@@ -41,18 +31,11 @@ def get_trending():
 
 async def hot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔥 Scanning...")
-
-    try:
-        data = get_trending()
-        await update.message.reply_text(data)
-    except Exception as e:
-        await update.message.reply_text(f"Error scanning market: {e}")
+    data = get_trending()
+    await update.message.reply_text(data)
 
 
 def main():
-    if not TOKEN:
-        raise ValueError("BOT_TOKEN is missing from Railway variables")
-
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
