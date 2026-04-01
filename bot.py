@@ -10,19 +10,22 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 SOLANATRACKER_API_KEY = os.getenv("SOLANATRACKER_API_KEY", "").strip()
-ALERT_MIN_SCORE = float(os.getenv("ALERT_MIN_SCORE", "68"))
-ALERT_MIN_EARLY_SCORE = float(os.getenv("ALERT_MIN_EARLY_SCORE", "70"))
-ALERT_INTERVAL_SECONDS = int(os.getenv("ALERT_INTERVAL_SECONDS", "30"))
+
+ALERT_MIN_SCORE = float(os.getenv("ALERT_MIN_SCORE", "62"))
+ALERT_MIN_EARLY_SCORE = float(os.getenv("ALERT_MIN_EARLY_SCORE", "58"))
+ALERT_INTERVAL_SECONDS = int(os.getenv("ALERT_INTERVAL_SECONDS", "25"))
 REQUEST_TIMEOUT = 20
 
-DATA_DIR = Path(".")
+DATA_DIR = Path(os.getenv("DATA_DIR", "."))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 WALLETS_FILE = DATA_DIR / "watched_wallets.json"
 CHAT_SETTINGS_FILE = DATA_DIR / "chat_settings.json"
 ALERT_STATE_FILE = DATA_DIR / "alert_state.json"
+TOKEN_HISTORY_FILE = DATA_DIR / "token_history.json"
 
 RESULT_LIMIT = 5
 
-# Balanced sniper settings
 MIN_SEND_LIQ = 12000
 MIN_SEND_VOL = 25000
 MIN_EARLY_LIQ = 5000
@@ -31,6 +34,10 @@ MAX_SAFE_PRICE_CHANGE_24H = 85
 MAX_SAFE_PRICE_CHANGE_1H = 35
 IDEAL_MIN_AGE = 5
 IDEAL_MAX_AGE = 180
+
+RE_ALERT_SCORE_JUMP = float(os.getenv("RE_ALERT_SCORE_JUMP", "8"))
+RE_ALERT_MIN_MINUTES = int(os.getenv("RE_ALERT_MIN_MINUTES", "8"))
+TOKEN_HISTORY_TTL_SECONDS = int(os.getenv("TOKEN_HISTORY_TTL_SECONDS", "21600"))
 
 
 def load_json(path: Path, default):
@@ -49,6 +56,7 @@ def save_json(path: Path, data):
 WATCHED_WALLETS = load_json(WALLETS_FILE, [])
 CHAT_SETTINGS = load_json(CHAT_SETTINGS_FILE, {})
 ALERT_STATE = load_json(ALERT_STATE_FILE, {"seen_tokens": {}})
+TOKEN_HISTORY = load_json(TOKEN_HISTORY_FILE, {})
 
 
 def safe_float(value, default=0.0):
@@ -178,6 +186,20 @@ def st_wallet_trades(wallet):
     return data.get("trades", [])
 
 
+def st_top_traders():
+    if not SOLANATRACKER_API_KEY:
+        return []
+    url = "https://data.solanatracker.io/top-traders/all"
+    r = requests.get(
+        url,
+        headers={"x-api-key": SOLANATRACKER_API_KEY},
+        timeout=REQUEST_TIMEOUT,
+    )
+    r.raise_for_status()
+    data = r.json()
+    return data.get("wallets", [])
+
+
 def build_boost_lookup():
     lookup = {}
     try:
@@ -252,6 +274,37 @@ def get_phase(age_mins, pc1, pc24, liquidity):
     return "LATE"
 
 
+def get_conviction_label(score, phase, wallet_cluster_count, pc1, pc24):
+    if pc24 > 100 or pc1 > 45:
+        return "TOO EXTENDED"
+    if wallet_cluster_count >= 2 and score >= 75:
+        return "SMART MONEY CONFIRMED"
+    if phase == "EARLY" and score >= 78:
+        return "SNIPER ENTRY"
+    if phase in ("EARLY", "MID") and score >= 68:
+        return "WATCH CLOSELY"
+    if score >= 58:
+        return "CONFIRMATION NEEDED"
+    return "AVOID"
+
+
+def market_cap_bonus(market_cap):
+    mc = safe_float(market_cap)
+    if 20000 <= mc <= 300000:
+        return 12
+    if 300001 <= mc <= 800000:
+        return 8
+    if 800001 <= mc <= 2000000:
+        return 4
+    if 0 < mc < 10000:
+        return -8
+    if mc > 5000000:
+        return -8
+    if mc > 2000000:
+        return -4
+    return 0
+
+
 def score_send(pair, boost_lookup):
     token = pair.get("baseToken", {})
     addr = token.get("address", "")
@@ -261,6 +314,7 @@ def score_send(pair, boost_lookup):
     pc6 = safe_float(pair.get("priceChange", {}).get("h6"))
     pc1 = safe_float(pair.get("priceChange", {}).get("h1"))
     fdv = safe_float(pair.get("fdv"))
+    market_cap = safe_float(pair.get("marketCap"))
     age_mins = token_age_minutes(pair)
 
     momentum = 0
@@ -297,6 +351,8 @@ def score_send(pair, boost_lookup):
     elif wallet_cluster["count"] == 1:
         wallet_score = 6
 
+    mc_bonus = market_cap_bonus(market_cap)
+
     risk_penalty = 0
     if liquidity < MIN_SEND_LIQ:
         risk_penalty += 10
@@ -312,11 +368,9 @@ def score_send(pair, boost_lookup):
         risk_penalty += 4
     risk_penalty += paid_order_penalty(addr)
 
-    score = momentum + quality + freshness + wallet_score - risk_penalty
+    score = momentum + quality + freshness + wallet_score + mc_bonus - risk_penalty
     score = round(clamp(score, 0, 100), 1)
-
     phase = get_phase(age_mins, pc1, pc24, liquidity)
-
     label = "WATCH"
     if score >= 84:
         label = "A-TIER RUNNER"
@@ -325,10 +379,13 @@ def score_send(pair, boost_lookup):
     elif score >= 68:
         label = "C-TIER SCALP"
 
+    conviction = get_conviction_label(score, phase, wallet_cluster["count"], pc1, pc24)
+
     return {
         "score": score,
         "label": label,
         "phase": phase,
+        "conviction": conviction,
         "wallet_cluster": wallet_cluster,
         "metrics": {
             "volume": volume,
@@ -338,6 +395,9 @@ def score_send(pair, boost_lookup):
             "pc1": pc1,
             "age_mins": age_mins,
             "boosted": addr in boost_lookup,
+            "market_cap": market_cap,
+            "fdv": fdv,
+            "mc_bonus": mc_bonus,
         },
     }
 
@@ -349,6 +409,8 @@ def score_early(pair, boost_lookup):
     liquidity = safe_float(pair.get("liquidity", {}).get("usd"))
     pc24 = safe_float(pair.get("priceChange", {}).get("h24"))
     pc1 = safe_float(pair.get("priceChange", {}).get("h1"))
+    market_cap = safe_float(pair.get("marketCap"))
+    fdv = safe_float(pair.get("fdv"))
     age_mins = token_age_minutes(pair)
 
     score = 0
@@ -368,6 +430,9 @@ def score_early(pair, boost_lookup):
         score += 14
     elif wallet_cluster["count"] == 1:
         score += 6
+
+    mc_bonus = market_cap_bonus(market_cap)
+    score += mc_bonus
 
     if liquidity < MIN_EARLY_LIQ:
         score -= 12
@@ -392,10 +457,13 @@ def score_early(pair, boost_lookup):
     elif score >= 70:
         label = "EARLY RUNNER"
 
+    conviction = get_conviction_label(score, phase, wallet_cluster["count"], pc1, pc24)
+
     return {
         "score": score,
         "label": label,
         "phase": phase,
+        "conviction": conviction,
         "wallet_cluster": wallet_cluster,
         "metrics": {
             "volume": volume,
@@ -404,19 +472,125 @@ def score_early(pair, boost_lookup):
             "pc1": pc1,
             "age_mins": age_mins,
             "boosted": addr in boost_lookup,
+            "market_cap": market_cap,
+            "fdv": fdv,
+            "mc_bonus": mc_bonus,
         },
     }
 
 
-def format_pair_message(pair, scored, mode="send"):
+def wallet_trust_score(summary, activity_trades=0):
+    total = safe_float(summary.get("total"))
+    invested = safe_float(summary.get("totalInvested"))
+    wins = safe_float(summary.get("totalWins"))
+    win_pct = safe_float(summary.get("winPercentage"))
+    avg_buy = safe_float(summary.get("averageBuyAmount"))
+
+    score = 0
+    score += clamp(total / 10000, 0, 30)
+    score += clamp(win_pct / 3, 0, 30)
+    score += clamp(wins / 5, 0, 20)
+    score += clamp(invested / 5000, 0, 10)
+    score += clamp(activity_trades / 3, 0, 10)
+
+    if avg_buy <= 0:
+        score -= 5
+
+    return round(clamp(score, 0, 100), 1)
+
+
+def get_top_wallets(mode="daily", limit=10):
+    if not SOLANATRACKER_API_KEY:
+        raise ValueError("SOLANATRACKER_API_KEY is missing")
+
+    wallets = st_top_traders()
+    ranked = []
+
+    for item in wallets[:50]:
+        wallet = item.get("wallet")
+        summary = item.get("summary", {}) or {}
+        recent_trades = []
+
+        try:
+            recent_trades = st_wallet_trades(wallet)[:25]
+        except Exception:
+            recent_trades = []
+
+        if mode == "daily":
+            cutoff_ms = (now_ts() - 86400) * 1000
+        else:
+            cutoff_ms = (now_ts() - 7 * 86400) * 1000
+
+        active_recent = [t for t in recent_trades if int(t.get("time", 0)) >= cutoff_ms]
+
+        if mode == "daily" and len(active_recent) < 1:
+            continue
+        if mode == "weekly" and len(active_recent) < 3:
+            continue
+
+        trust = wallet_trust_score(summary, activity_trades=len(active_recent))
+
+        ranked.append(
+            {
+                "wallet": wallet,
+                "trust": trust,
+                "summary": summary,
+                "recent_trade_count": len(active_recent),
+            }
+        )
+
+    ranked.sort(key=lambda x: x["trust"], reverse=True)
+    return ranked[:limit]
+
+
+def format_top_wallets_message(mode="daily", limit=10):
+    rows = get_top_wallets(mode=mode, limit=limit)
+
+    if not rows:
+        return f"No {mode} top wallets found right now."
+
+    title = "🧠 <b>Top wallets today</b>" if mode == "daily" else "📅 <b>Top wallets this week</b>"
+    lines = [title, ""]
+
+    for i, row in enumerate(rows, start=1):
+        s = row["summary"]
+        lines.append(f"{i}. <code>{escape(row['wallet'])}</code>")
+        lines.append(f"⭐ <b>Trust:</b> {row['trust']}/100")
+        lines.append(f"💵 <b>Total PnL:</b> {format_num(safe_float(s.get('total')))}")
+        lines.append(f"🎯 <b>Win %:</b> {safe_float(s.get('winPercentage')):.2f}%")
+        lines.append(f"✅ <b>Wins:</b> {int(safe_float(s.get('totalWins')))}")
+        lines.append(f"📦 <b>Invested:</b> {format_num(safe_float(s.get('totalInvested')))}")
+        lines.append(f"🔄 <b>Recent trades:</b> {row['recent_trade_count']}")
+        action = "ADD" if row["trust"] >= 70 else "WATCH" if row["trust"] >= 55 else "IGNORE"
+        lines.append(f"🛠️ <b>Action:</b> {action}")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+def add_top_wallets(count=5, mode="daily"):
+    rows = get_top_wallets(mode=mode, limit=max(count, 10))
+    added = []
+
+    for row in rows:
+        wallet = row["wallet"]
+        if wallet not in WATCHED_WALLETS and row["trust"] >= 60:
+            WATCHED_WALLETS.append(wallet)
+            added.append(wallet)
+        if len(added) >= count:
+            break
+
+    save_json(WALLETS_FILE, WATCHED_WALLETS)
+    return added
+
+
+def format_pair_message(pair, scored, mode="send", header_prefix=None):
     token = pair.get("baseToken", {})
     addr = token.get("address", "N/A")
     name = token.get("name", "Unknown")
     symbol = token.get("symbol", "")
     url = pair.get("url", "")
     price = pair.get("priceUsd", "0")
-    market_cap = safe_float(pair.get("marketCap"))
-    fdv = safe_float(pair.get("fdv"))
     m = scored["metrics"]
 
     wallet_line = "0"
@@ -427,15 +601,22 @@ def format_pair_message(pair, scored, mode="send"):
     if symbol:
         title += f" ({escape(symbol)})"
 
-    parts = [
+    parts = []
+    if header_prefix:
+        parts.append(header_prefix)
+        parts.append("")
+
+    parts += [
         f"🚨 <b>{escape(scored['label'])}</b>",
+        f"🎯 <b>{escape(scored['conviction'])}</b>",
         "",
         title,
         f"🔥 <b>Score:</b> {scored['score']}/100",
         f"🧠 <b>Phase:</b> {escape(scored['phase'])}",
         f"💰 <b>Price:</b> ${escape(format_price(price))}",
-        f"🏦 <b>Market Cap:</b> {escape(format_num(market_cap))}" if market_cap > 0 else "🏦 <b>Market Cap:</b> N/A",
-        f"🧮 <b>FDV:</b> {escape(format_num(fdv))}" if fdv > 0 else "🧮 <b>FDV:</b> N/A",
+        f"🏦 <b>Market Cap:</b> {escape(format_num(m['market_cap']))}" if m["market_cap"] > 0 else "🏦 <b>Market Cap:</b> N/A",
+        f"🧮 <b>FDV:</b> {escape(format_num(m['fdv']))}" if m["fdv"] > 0 else "🧮 <b>FDV:</b> N/A",
+        f"🎁 <b>MC Bonus:</b> {m['mc_bonus']:+.0f}",
         f"📊 <b>Vol 24h:</b> {escape(format_num(m['volume']))}",
         f"💧 <b>Liq:</b> {escape(format_num(m['liquidity']))}",
     ]
@@ -467,6 +648,118 @@ def format_pair_message(pair, scored, mode="send"):
         parts.append(f"🔗 <b>Chart:</b> {escape(url)}")
 
     return "\n".join(parts)
+
+
+def update_token_history(mode, pair, result):
+    token_addr = pair.get("baseToken", {}).get("address")
+    if not token_addr:
+        return
+
+    key = f"{mode}:{token_addr}"
+    existing = TOKEN_HISTORY.get(key, {})
+
+    TOKEN_HISTORY[key] = {
+        "name": pair.get("baseToken", {}).get("name", "Unknown"),
+        "symbol": pair.get("baseToken", {}).get("symbol", ""),
+        "score": result["score"],
+        "market_cap": result["metrics"].get("market_cap", 0),
+        "volume": result["metrics"].get("volume", 0),
+        "liquidity": result["metrics"].get("liquidity", 0),
+        "wallet_cluster": result["wallet_cluster"]["count"],
+        "updated_at": now_ts(),
+        "first_seen": existing.get("first_seen", now_ts()),
+    }
+
+
+def cleanup_token_history():
+    cutoff = now_ts() - TOKEN_HISTORY_TTL_SECONDS
+    dead_keys = [k for k, v in TOKEN_HISTORY.items() if v.get("updated_at", 0) < cutoff]
+    for k in dead_keys:
+        del TOKEN_HISTORY[k]
+
+
+def should_realert(mode, pair, result):
+    token_addr = pair.get("baseToken", {}).get("address")
+    if not token_addr:
+        return False, None
+
+    key = f"{mode}:{token_addr}"
+    old = TOKEN_HISTORY.get(key)
+
+    if not old:
+        return False, None
+
+    minutes_since = (now_ts() - old.get("updated_at", now_ts())) / 60
+    score_jump = result["score"] - safe_float(old.get("score", 0))
+    mc_jump = safe_float(result["metrics"].get("market_cap", 0)) - safe_float(old.get("market_cap", 0))
+    wallet_jump = result["wallet_cluster"]["count"] - int(old.get("wallet_cluster", 0))
+
+    if minutes_since < RE_ALERT_MIN_MINUTES:
+        return False, None
+
+    if score_jump >= RE_ALERT_SCORE_JUMP:
+        reason = f"Score jumped +{score_jump:.1f}"
+        if wallet_jump > 0:
+            reason += f" | Wallet cluster +{wallet_jump}"
+        if mc_jump > 0:
+            reason += f" | MC +{format_num(mc_jump)}"
+        return True, reason
+
+    if wallet_jump >= 1:
+        return True, f"Wallet cluster increased to {result['wallet_cluster']['count']}"
+
+    return False, None
+
+
+def get_alpha_summary():
+    send_candidates = []
+    early_candidates = []
+
+    try:
+        send_candidates = get_send_candidates()
+    except Exception:
+        pass
+
+    try:
+        early_candidates = get_early_candidates()
+    except Exception:
+        pass
+
+    lines = ["🧠 <b>Alpha Summary</b>", ""]
+
+    if send_candidates:
+        pair, result = send_candidates[0]
+        name = pair.get("baseToken", {}).get("name", "Unknown")
+        symbol = pair.get("baseToken", {}).get("symbol", "")
+        label = name if not symbol else f"{name} ({symbol})"
+        lines.append(f"🔥 <b>Best send:</b> {escape(label)} — {result['score']}/100")
+    else:
+        lines.append("🔥 <b>Best send:</b> None right now")
+
+    if early_candidates:
+        pair, result = early_candidates[0]
+        name = pair.get("baseToken", {}).get("name", "Unknown")
+        symbol = pair.get("baseToken", {}).get("symbol", "")
+        label = name if not symbol else f"{name} ({symbol})"
+        lines.append(f"🆕 <b>Best early:</b> {escape(label)} — {result['score']}/100")
+    else:
+        lines.append("🆕 <b>Best early:</b> None right now")
+
+    improving = []
+    for k, v in TOKEN_HISTORY.items():
+        if now_ts() - v.get("updated_at", 0) <= 3600:
+            improving.append((safe_float(v.get("score", 0)), v))
+
+    improving.sort(reverse=True, key=lambda x: x[0])
+
+    if improving:
+        v = improving[0][1]
+        label = v.get("name", "Unknown")
+        if v.get("symbol"):
+            label += f" ({v['symbol']})"
+        lines.append(f"📈 <b>Strongest tracked:</b> {escape(label)} — {safe_float(v.get('score', 0))}/100")
+
+    return "\n".join(lines)
 
 
 def get_send_candidates():
@@ -614,11 +907,15 @@ def handle_command(chat_id, text):
     if cmd in ("/start", "/help"):
         send_message(
             chat_id,
-            "🚀 <b>Balanced Sniper Bot is LIVE</b>\n\n"
+            "🚀 <b>Balanced Sniper V2 Brain is LIVE</b>\n\n"
             "<b>Commands</b>\n"
             "/send - best current setups\n"
             "/early - balanced early setups\n"
+            "/alpha - quick command center summary\n"
             "/smart - tracked-wallet cluster buys\n"
+            "/topwallets daily - best wallets today\n"
+            "/topwallets weekly - best wallets this week\n"
+            "/addtopwallets 5 daily - add best wallets to watchlist\n"
             "/watchwallet &lt;address&gt; - add wallet\n"
             "/unwatchwallet &lt;address&gt; - remove wallet\n"
             "/wallets - list watched wallets\n"
@@ -630,6 +927,50 @@ def handle_command(chat_id, text):
         )
         return
 
+    if cmd == "/topwallets":
+        if len(parts) < 2:
+            send_message(chat_id, "Use: /topwallets daily or /topwallets weekly")
+            return
+        mode = parts[1].lower()
+        if mode not in ("daily", "weekly"):
+            send_message(chat_id, "Use: /topwallets daily or /topwallets weekly")
+            return
+        try:
+            send_message(chat_id, format_top_wallets_message(mode=mode, limit=10))
+        except Exception as e:
+            send_message(chat_id, f"Top wallets error: {escape(e)}")
+        return
+
+    if cmd == "/addtopwallets":
+        if len(parts) < 3:
+            send_message(chat_id, "Use: /addtopwallets 5 daily")
+            return
+        try:
+            count = int(parts[1])
+        except ValueError:
+            send_message(chat_id, "Count must be a number. Example: /addtopwallets 5 daily")
+            return
+
+        mode = parts[2].lower()
+        if mode not in ("daily", "weekly"):
+            send_message(chat_id, "Use mode daily or weekly. Example: /addtopwallets 5 daily")
+            return
+
+        try:
+            added = add_top_wallets(count=count, mode=mode)
+            if not added:
+                send_message(chat_id, "No top wallets were added.")
+                return
+            msg = "✅ <b>Added top wallets</b>\n\n" + "\n".join(f"• <code>{escape(w)}</code>" for w in added)
+            send_message(chat_id, msg)
+        except Exception as e:
+            send_message(chat_id, f"Add top wallets error: {escape(e)}")
+        return
+
+    if cmd == "/alpha":
+        send_message(chat_id, get_alpha_summary())
+        return
+
     if cmd == "/status":
         state = "ON" if CHAT_SETTINGS[str(chat_id)].get("alerts") else "OFF"
         send_message(
@@ -639,7 +980,8 @@ def handle_command(chat_id, text):
             f"Alert interval: <b>{ALERT_INTERVAL_SECONDS}s</b>\n"
             f"Send threshold: <b>{ALERT_MIN_SCORE}</b>\n"
             f"Early threshold: <b>{ALERT_MIN_EARLY_SCORE}</b>\n"
-            f"Watched wallets: <b>{len(WATCHED_WALLETS)}</b>"
+            f"Watched wallets: <b>{len(WATCHED_WALLETS)}</b>\n"
+            f"Re-alert jump: <b>{RE_ALERT_SCORE_JUMP}</b>"
         )
         return
 
@@ -650,6 +992,9 @@ def handle_command(chat_id, text):
             if not scored:
                 send_message(chat_id, "No good send setups right now.")
                 return
+            for pair, result in scored:
+                update_token_history("send", pair, result)
+            save_json(TOKEN_HISTORY_FILE, TOKEN_HISTORY)
             msg = "🔥 <b>Top balanced send setups</b>\n\n" + "\n\n---\n\n".join(
                 format_pair_message(pair, result, mode="send") for pair, result in scored
             )
@@ -665,6 +1010,9 @@ def handle_command(chat_id, text):
             if not scored:
                 send_message(chat_id, "No balanced early runners right now.")
                 return
+            for pair, result in scored:
+                update_token_history("early", pair, result)
+            save_json(TOKEN_HISTORY_FILE, TOKEN_HISTORY)
             msg = "🆕 <b>Top balanced early setups</b>\n\n" + "\n\n---\n\n".join(
                 format_pair_message(pair, result, mode="early") for pair, result in scored
             )
@@ -746,6 +1094,7 @@ def alert_loop():
     if not enabled_chats:
         return
 
+    cleanup_token_history()
     candidates = []
 
     try:
@@ -770,11 +1119,31 @@ def alert_loop():
         key = f"{mode}:{token_addr}"
         last_sent = ALERT_STATE["seen_tokens"].get(key, 0)
 
-        if now_ts() - last_sent < 1800:
+        send_type = None
+        reason = None
+
+        if now_ts() - last_sent >= 1800:
+            send_type = "fresh"
+
+        relert, reason = should_realert(mode, pair, result)
+        if relert:
+            send_type = "realert"
+
+        if not send_type:
+            update_token_history(mode, pair, result)
             continue
 
-        header = "🚨 <b>Auto send alert</b>\n\n" if mode == "send" else "🆕 <b>Auto early alert</b>\n\n"
-        msg = header + format_pair_message(pair, result, mode="send" if mode == "send" else "early")
+        if send_type == "fresh":
+            header = "🚨 <b>Auto send alert</b>\n\n" if mode == "send" else "🆕 <b>Auto early alert</b>\n\n"
+            msg = format_pair_message(pair, result, mode="send" if mode == "send" else "early", header_prefix=header.strip())
+        else:
+            header = "📈 <b>Re-alert: setup improving</b>"
+            msg = format_pair_message(
+                pair,
+                result,
+                mode="send" if mode == "send" else "early",
+                header_prefix=f"{header}\n<b>Reason:</b> {escape(reason)}"
+            )
 
         for chat_id in enabled_chats:
             try:
@@ -783,14 +1152,17 @@ def alert_loop():
                 pass
 
         ALERT_STATE["seen_tokens"][key] = now_ts()
-        save_json(ALERT_STATE_FILE, ALERT_STATE)
+        update_token_history(mode, pair, result)
+
+    save_json(ALERT_STATE_FILE, ALERT_STATE)
+    save_json(TOKEN_HISTORY_FILE, TOKEN_HISTORY)
 
 
 def main():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN is missing")
 
-    print("Balanced sniper bot starting...")
+    print("Balanced sniper V2 brain starting...")
     offset = None
     last_alert_run = 0
 
